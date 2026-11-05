@@ -1,0 +1,87 @@
+name: External service watchdog
+on:
+  schedule:
+    - cron: '2-59/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Check service or verify notification delivery
+        type: choice
+        options: [check, test-alert]
+        default: check
+permissions:
+  contents: write
+  issues: write
+concurrency:
+  group: external-watchdog
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      SERVICE_URL: ${{ secrets.SERVICE_URL }}
+      HEALTH_KEY: ${{ secrets.HEALTH_KEY }}
+      ALERT_BOT_TOKEN: ${{ secrets.ALERT_BOT_TOKEN }}
+      ALERT_RECIPIENTS: ${{ secrets.ALERT_RECIPIENTS }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPOSITORY: ${{ github.repository }}
+      MODE: ${{ inputs.mode || 'check' }}
+    steps:
+      - name: Check health and notify on transitions
+        shell: python
+        run: |
+          import os, json, time, base64, datetime, urllib.request, urllib.parse, urllib.error
+          def fetch(url, method='GET', body=None, headers=None):
+              req=urllib.request.Request(url,data=None if body is None else json.dumps(body).encode(),method=method,headers={'Content-Type':'application/json',**(headers or {})})
+              with urllib.request.urlopen(req,timeout=15) as r:
+                  return json.load(r)
+          def github(path, method='GET', body=None):
+              return fetch('https://api.github.com/repos/'+os.environ['GH_REPOSITORY']+path,method,body,{'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'})
+          def notify(text):
+              recipients=json.loads(os.environ.get('ALERT_RECIPIENTS') or '[]')
+              if not recipients or not os.environ.get('ALERT_BOT_TOKEN'): return
+              for recipient in recipients:
+                  try:
+                      result=fetch('https://api.telegram.org/bot'+os.environ['ALERT_BOT_TOKEN']+'/sendMessage','POST',{'chat_id':recipient,'text':text,'link_preview_options':{'is_disabled':True}})
+                      if not result.get('ok'): raise RuntimeError()
+                  except Exception:
+                      raise RuntimeError('Notification delivery failed') from None
+          # Maintain real repository activity so public scheduled checks stay enabled.
+          month=datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m')
+          try:
+              previous=github('/contents/activity.txt')
+          except urllib.error.HTTPError as e:
+              if e.code!=404: raise
+              previous=None
+          old=base64.b64decode(previous['content']).decode().strip() if previous else ''
+          if old!=month:
+              entry={'message':'Maintain monitoring schedule for '+month,'content':base64.b64encode((month+'\n').encode()).decode()}
+              if previous: entry['sha']=previous['sha']
+              github('/contents/activity.txt','PUT',entry)
+          if os.environ['MODE']=='test-alert':
+              owner=os.environ['GH_REPOSITORY'].split('/')[0]
+              item=github('/issues','POST',{'title':'[watchdog] Notification test','body':'Controlled notification test from independent monitoring. The monitored service was not stopped.','assignees':[owner]})
+              github('/issues/'+str(item['number']),'PATCH',{'state':'closed','state_reason':'completed'})
+              notify('BLACKGATE: проверка внешнего мониторинга. Уведомление пришло с независимого сервера GitHub. CRM и боты не останавливались.')
+              print('Test notification delivered')
+          else:
+              healthy=False
+              for attempt in range(3):
+                  try:
+                      result=fetch(os.environ['SERVICE_URL'],headers={'Authorization':'Bearer '+os.environ['HEALTH_KEY']})
+                      healthy=result.get('ok') is True
+                  except Exception:
+                      healthy=False
+                  if healthy: break
+                  if attempt<2: time.sleep(5)
+              issues=github('/issues?state=open&per_page=100')
+              incident=next((i for i in issues if i.get('title')=='[watchdog] Service incident' and i.get('user',{}).get('login')=='github-actions[bot]'),None)
+              if not healthy and not incident:
+                  notify('BLACKGATE: внешняя проверка обнаружила сбой. CRM недоступна либо один из ботов или резервных процессов перестал отвечать. Требуется проверка сервера.')
+                  github('/issues','POST',{'title':'[watchdog] Service incident','body':'External health check failed. Diagnostics and target address are intentionally omitted.','assignees':[os.environ['GH_REPOSITORY'].split('/')[0]]})
+              elif healthy and incident:
+                  notify('BLACKGATE: внешняя проверка снова проходит. CRM, боты и контроль резервных копий отвечают.')
+                  github('/issues/'+str(incident['number']),'PATCH',{'state':'closed','state_reason':'completed'})
+              print('Service healthy' if healthy else 'Incident open')
+              if not healthy: raise SystemExit(1)
