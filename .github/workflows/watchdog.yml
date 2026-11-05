@@ -1,7 +1,7 @@
 name: External service watchdog
 on:
   schedule:
-    - cron: '2-59/5 * * * *'
+    - cron: '3-58/5 * * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -82,6 +82,7 @@ jobs:
                   github('/issues','POST',{'title':'[watchdog] Service incident','body':'External health check failed. Diagnostics and target address are intentionally omitted.','assignees':[os.environ['GH_REPOSITORY'].split('/')[0]]})
               elif healthy and incident:
                   notify('BLACKGATE: внешняя проверка снова проходит. CRM, боты и контроль резервных копий отвечают.')
+                  github('/issues/'+str(incident['number'])+'/comments','POST',{'body':'@'+os.environ['GH_REPOSITORY'].split('/')[0]+' External health check passed; recovery confirmed.'})
                   github('/issues/'+str(incident['number']),'PATCH',{'state':'closed','state_reason':'completed'})
               print('Service healthy' if healthy else 'Incident open')
               if not healthy: raise SystemExit(1)
