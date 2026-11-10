@@ -85,4 +85,6 @@ jobs:
                   github('/issues/'+str(incident['number'])+'/comments','POST',{'body':'@'+os.environ['GH_REPOSITORY'].split('/')[0]+' External health check passed; recovery confirmed.'})
                   github('/issues/'+str(incident['number']),'PATCH',{'state':'closed','state_reason':'completed'})
               print('Service healthy' if healthy else 'Incident open')
-              if not healthy: raise SystemExit(1)
+              # An open incident already reports the outage. Do not fail every scheduled
+              # run: GitHub would send another failed-workflow email for the same incident.
+              # Transport/notification exceptions still fail the job and remain visible.
